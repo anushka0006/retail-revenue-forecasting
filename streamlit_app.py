@@ -39,7 +39,7 @@ def show(fig):
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         margin=dict(l=10, r=10, t=50, b=10),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, title_text=""),
         font=dict(family="Source Sans Pro, sans-serif"),
     )
     fig.update_xaxes(showgrid=False)
@@ -172,7 +172,9 @@ def load_data():
         category = "department" if "department" in products else "commodity_desc"
         products = products[["product_id", category]].drop_duplicates("product_id")
         data = data.merge(products, on="product_id", how="left")
-        data[category] = data[category].fillna("Unknown")
+        # Blank or missing names become "Unknown" (fixes the empty tag in the filter)
+        cleaned = data[category].astype("string").str.strip()
+        data[category] = cleaned.mask(cleaned.isna() | (cleaned == ""), "Unknown").astype(str)
         data = data.rename(columns={category: "category"})
     else:
         data["category"] = "All products (product.csv not supplied)"
@@ -188,14 +190,23 @@ if data.empty:
     st.error("No usable transaction rows were found.")
     st.stop()
 
+
+@st.cache_data(max_entries=4, show_spinner=False)
+def filtered_csv(week_range, categories):
+    subset = data[data.week_no.between(*week_range) & data.category.astype(str).isin(categories)]
+    return subset.to_csv(index=False).encode("utf-8")
+
+
 # ---------- Sidebar ----------
 with st.sidebar:
     st.header("Filters")
     weeks = sorted(data.week_no.dropna().unique().tolist())
     week_range = st.slider("Transaction week", int(min(weeks)), int(max(weeks)), (int(min(weeks)), int(max(weeks))))
     category_options = sorted(data.category.dropna().astype(str).unique())
-    selected_categories = st.multiselect("Category", category_options, default=category_options)
+    picked = st.multiselect("Category", category_options, default=[], placeholder="All categories")
+    selected_categories = picked if picked else category_options
     view = data[data.week_no.between(*week_range) & data.category.astype(str).isin(selected_categories)]
+    st.caption(f"{len(selected_categories)} of {len(category_options)} categories included")
     st.divider()
     n_households = data["household_key"].nunique() if "household_key" in data.columns else None
     sample_note = f" Sample of {n_households:,} households." if n_households else ""
@@ -210,21 +221,39 @@ if view.empty:
 net = view.sales_value.sum()
 discounts = view.discount_total.sum()
 gross = view.gross_sales.sum()
+if "basket_id" in view.columns:
+    volume_label, volume_value = "Baskets", view.basket_id.nunique()
+else:
+    volume_label, volume_value = "Line items", len(view)
 kpis = st.columns(5)
 kpis[0].metric("Net sales", f"${net:,.0f}")
 kpis[1].metric("Recorded discounts", f"${discounts:,.0f}")
 kpis[2].metric("Discount rate", f"{discounts / gross if gross else 0:.1%}")
-kpis[3].metric("Recorded quantity", f"{view.quantity.sum():,.0f}")
+kpis[3].metric(volume_label, f"{volume_value:,.0f}")
 kpis[4].metric("Discounted line items", f"{view.discounted.mean():.1%}")
-st.write("")
+st.caption("Discount rate = recorded discounts ÷ (net sales + recorded discounts). Gross sales is derived, not a source field.")
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["Overview", "Forecast", "Discounts", "Categories", "Campaigns"])
 with tab1:
     weekly = view.groupby("week_no", as_index=False).agg(
         net_sales=("sales_value", "sum"), discounts=("discount_total", "sum"))
-    show(px.line(weekly, x="week_no", y=["net_sales", "discounts"], markers=True,
-                 title="Weekly net sales and recorded discounts"))
-    st.caption("Weeks are a relative index in the source data, not calendar dates.")
+    weekly = weekly.rename(columns={"net_sales": "Net sales", "discounts": "Discounts"})
+    show(px.line(weekly, x="week_no", y=["Net sales", "Discounts"], markers=True,
+                 title="Weekly net sales and recorded discounts",
+                 labels={"week_no": "Week", "value": "Dollars ($)"}))
+    st.caption("Weeks are a relative index in the source data, not calendar dates. "
+               "Sales climb steeply in the earliest weeks; read that as how this dataset starts, not as a trend to extrapolate.")
+    with st.expander("Data quality notes"):
+        q = view["quantity"]
+        notes = pd.DataFrame({
+            "Measure": ["Line items", "Median quantity per line", "Mean quantity per line",
+                        "99th percentile quantity", "Maximum quantity", "Lines with negative sales (returns)"],
+            "Value": [f"{len(view):,}", f"{q.median():,.1f}", f"{q.mean():,.1f}",
+                      f"{q.quantile(0.99):,.1f}", f"{q.max():,.0f}", f"{(view.sales_value < 0).mean():.2%}"],
+        })
+        st.dataframe(notes, hide_index=True, width="stretch")
+        st.caption("Total quantity is not shown as a headline figure: in this dataset it is heavily skewed, "
+                   "so a raw sum is not a reliable unit count.")
 with tab2:
     forecast, backtest, result = forecast_weekly_sales(view)
     if forecast is None:
@@ -242,18 +271,22 @@ with tab2:
         historical_chart = history.assign(series="Historical sales")
         chart_data = pd.concat([historical_chart, backtest_chart, future_chart], ignore_index=True)
         show(px.line(chart_data, x="week_no", y="sales", color="series", markers=True,
-                     title="Historical sales, holdout backtest, and 8-week forecast"))
-        st.dataframe(forecast, width="stretch", hide_index=True)
-        st.caption("The app selects between a 4-week moving average and a 52-week seasonal naïve baseline using holdout MAE. This forecast is an estimate, not a guaranteed outcome.")
+                     title="Historical sales, holdout backtest, and 8-week forecast",
+                     labels={"week_no": "Week", "sales": "Sales ($)"}))
+        forecast_table = forecast.rename(columns={"week_no": "Week", "forecast_sales": "Forecast sales ($)"})
+        st.dataframe(forecast_table, width="stretch", hide_index=True)
+        st.caption("The app selects between a 4-week moving average and a 52-week seasonal naïve baseline using holdout MAE. "
+                   "A moving-average forecast is flat by design and shows no trend or seasonality. "
+                   "This forecast is an estimate, not a guaranteed outcome.")
 with tab3:
     amounts = pd.DataFrame({"Discount type": ["Retailer", "Coupon", "Retailer coupon match"],
         "Amount": [view.retail_disc.sum(), view.coupon_disc.sum(), view.coupon_match_disc.sum()]})
     show(px.bar(amounts, x="Discount type", y="Amount", color="Discount type",
-                title="Recorded discount amounts"))
+                title="Recorded discount amounts", labels={"Amount": "Amount ($)"}))
     by_status = view.groupby("discounted", as_index=False).agg(net_sales=("sales_value", "sum"))
     by_status["Status"] = by_status.discounted.map({True: "Discount recorded", False: "No discount"})
     show(px.bar(by_status, x="Status", y="net_sales", color="Status",
-                title="Net sales by observed discount status"))
+                title="Net sales by observed discount status", labels={"net_sales": "Net sales ($)"}))
 with tab4:
     summary = view.groupby("category", as_index=False).agg(
         net_sales=("sales_value", "sum"), units=("quantity", "sum"),
@@ -261,8 +294,12 @@ with tab4:
     summary = summary.sort_values("net_sales", ascending=False)
     top = summary.head(20).sort_values("net_sales")
     show(px.bar(top, x="net_sales", y="category", orientation="h",
-                title="Top categories by net sales"))
-    st.dataframe(summary, width="stretch", hide_index=True)
+                title="Top categories by net sales", labels={"net_sales": "Net sales ($)", "category": ""}))
+    table = summary.rename(columns={"category": "Category", "net_sales": "Net sales ($)",
+                                    "units": "Quantity (raw)", "discounts": "Discounts ($)",
+                                    "line_items": "Line items"})
+    st.dataframe(table, width="stretch", hide_index=True)
+    st.caption("Quantity is the raw source field and may mix units, weights and bulk codes; compare categories by sales, not quantity.")
 with tab5:
     redemptions = optional.get("coupon_redempt.csv")
     campaigns = optional.get("campaign_table.csv")
@@ -284,7 +321,8 @@ with tab5:
                 descriptions.columns = [name.lower() for name in descriptions.columns]
                 summary = summary.merge(descriptions, on="campaign", how="left")
             st.dataframe(summary.sort_values("redemption_rate", ascending=False), width="stretch", hide_index=True)
-            st.caption("Descriptive event rate for the sampled households; a household may redeem more than once.")
+            st.caption("Descriptive event rate for the sampled households; a household may redeem more than once. "
+                       "Campaign figures ignore the week and category filters.")
 
-st.download_button("Download filtered transactions", view.to_csv(index=False).encode("utf-8"),
+st.download_button("Download filtered transactions", filtered_csv(week_range, tuple(selected_categories)),
                    "filtered_transactions.csv", "text/csv")
